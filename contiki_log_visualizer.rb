@@ -22,7 +22,9 @@ class LogParser
     @nodes = []
     num_nodes.times do |i|
       @nodes[i] = {
-        handshake: {value: [], time: []},
+        client_hello: {value: [], time: []},
+        retransmit_client_hello: {value: [], time: []},
+        handshake_complete: {value: [], time: []},
         connect: {value: [], time: []},
         register: {value: [], time: []},
         subscribe: {value: [], time: []},
@@ -56,6 +58,12 @@ class LogParser
       :recv_subscribe
     when /\[MQTT-SN\][^@]+@PUBLISH/
       :publish
+    when /send handshake packet of type: client_hello \(1\)/
+      :client_hello
+    when /\*\* retransmit handshake packet of type: client_hello \(1\)/
+      :retransmit_client_hello
+    when /Handshake complete/
+      :handshake_complete
     else
       return
     end
@@ -123,18 +131,30 @@ class LogParser
   end
   
   def parse_radio_message(radio_message)
-    type = radio_message[6]
-    message = (radio_message[6] == 'D') ? radio_message[10] : "ACK"
-    src_id = radio_message[2].to_i
+    type = radio_message[:type]
+    message = if type == 'D'
+                if radio_message[:ip_packet] == "FRAGN"
+                  radio_message[:ip_packet]
+                else
+                  "#{radio_message[:ip_packet]}|#{radio_message[:payload]}"
+                end
+              else
+                "ACK"
+              end
+    src_id = radio_message[:src_id].to_i
     add_message(src_id, :tx, type, message)
-    if radio_message[3] == '-'
+    if radio_message[:dst_id] == '-'
       # TODO: The meaning of '-' is not clear yet. It should be investigated
       # currently, it is treated as sent but lost packet.
       #@nodes.size.times do |node_id|
       #  add_message(node_id, :rx, type, message)
       #end
+    elsif radio_message[:dst_id].match(/,/)
+      radio_message[:dst_id].split(/,/).map {|d| d.to_i}.each do |node_id|
+        add_message(node_id, :rx, type, message)
+      end
     else
-      dst_id = radio_message[3].to_i
+      dst_id = radio_message[:dst_id].to_i
       add_message(dst_id, :rx, type, message)
     end
   end
@@ -144,11 +164,11 @@ class LogParser
     @interval = 0.100
     init_next_radio_status
     File.foreach(file) do |line|
-      radio_message = line.match(/(\d+)\s+([\d\-]+)\s+([\d\-]+)\s+(\d+):\s+(\d+\.\d+)\s+([DA])\s+[^\|]+\|((IPHC\|IPv6)|(IPv6))\|([^\|]+)/)
+      radio_message = line.match(/(?<timestamp>\d+)\s+(?<src_id>[\d\-]+)\s+(?<dst_id>[\d\-\,]+)\s+(?<size>\d+):\s+(?<protocol>\d+\.\d+)\s+(?<type>[DA])\s+[^\|]+\|(?<ip_packet>(FRAG1\|IPHC\|IPv6)|(FRAGN)|(IPHC\|IPv6)|(IPv6))\|(?<payload>[^\|]+)/)
       if radio_message.nil?
-        radio_message = line.match(/(\d+)\s+([\d\-]+)\s+([\d\-]+)\s+(\d+):\s+(\d+\.\d+)\s+([DA])/)
+        radio_message = line.match(/(?<timestamp>\d+)\s+(?<src_id>[\d\-]+)\s+(?<dst_id>[\d\-\,]+)\s+(?<size>\d+):\s+(?<protocol>\d+\.\d+)\s+(?<type>[DA])/)
       end
-      while (@cursor + 1) * @interval < LogParser.get_ms(radio_message[1])
+      while (@cursor + 1) * @interval < LogParser.get_ms(radio_message[:timestamp])
         @cursor += 1
         init_next_radio_status
       end
@@ -188,30 +208,40 @@ class LogParser
     end
   end
 
-  def visualize_node(node_id, attr_filter = nil, mqtt_event_filter = nil, radio_filter = nil, radio_message = true)
+  def visualize_node(node_id, opts = {})
     node = @nodes[node_id - 1]
-    attr_filter ||= [:cpu, :lpm, :radio, :radio_tx, :radio_listen]
-    mqtt_event_filter ||= [:connect, :register, :subscribe, :recv_subscribe, :publish]
+    options = {
+      xrange: "[0 to 35]",
+      yrange: "[0 to 10000]",
+      attr_filter: [:cpu, :lpm, :radio, :radio_tx, :radio_listen],
+      event_filter: [:connect, :register, :subscribe, :recv_subscribe, :publish, :client_hello, :retransmit_client_hello, :handshake_complete],
+      radio_filter: nil,
+      radio_message: true
+    }.merge(opts)
     Numo.gnuplot do
       set title: "powertrace of node id: #{node_id}"
-      set yrange: "[0 to 10000]"
+      set xrange: options[:xrange]
+      set yrange: options[:yrange]
       plot *(
-        attr_filter.map {|key|
+        options[:attr_filter].map {|key|
           [node[key][:time], node[key][:value], {w: :lp, t: key.to_s.gsub('_', ' ')}]
-        } + mqtt_event_filter.map {|key|
+        } + options[:event_filter].map {|key|
           [node[key][:time], node[key][:value], {t: key.to_s.gsub('_', ' ')}]
-        } + ((radio_message == false) ? [] : [
-          [node[:radio_message][:time], node[:radio_message][:tx].map {|v| LogParser.message_filter(v, radio_filter)}, {w: :lp, t: "tx"}],
-          [node[:radio_message][:time], node[:radio_message][:rx].map {|v| LogParser.message_filter(v, radio_filter)}, {w: :lp, t: "rx"}]
+        } + ((options[:radio_message] == false) ? [] : [
+          [node[:radio_message][:time], node[:radio_message][:tx].map {|v| LogParser.message_filter(v, options[:radio_filter])}, {w: :lp, t: "tx"}],
+          [node[:radio_message][:time], node[:radio_message][:rx].map {|v| LogParser.message_filter(v, options[:radio_filter])}, {w: :lp, t: "rx"}]
         ]))
     end
   end
 end
 
-@mqtt_sn = LogParser.new(2)
-@mqtt_sn.parse_powertrace_file("./sample_data/mqtt_sn/mote-output.txt")
-@mqtt_sn.parse_radio_file("./sample_data/mqtt_sn/radio-messages.txt")
+#@mqtt_sn = LogParser.new(2)
+#@mqtt_sn.parse_powertrace_file("./sample_data/2018-03-10/mqtt_sn/mote-output.txt")
+#@mqtt_sn.parse_radio_file("./sample_data/2018-03-10/mqtt_sn/radio-messages.txt")
 
-@mqtt_sn_dtls = LogParser.new(2)
-@mqtt_sn_dtls.parse_powertrace_file("./sample_data/mqtt_sn_dtls/mote-output.txt")
-@mqtt_sn_dtls.parse_radio_file("./sample_data/mqtt_sn_dtls/radio-messages.txt")
+#@mqtt_sn_dtls = LogParser.new(2)
+#@mqtt_sn_dtls.parse_powertrace_file("./sample_data/2018-03-11/mqtt_sn_dtls/mote-output.txt")
+#@mqtt_sn_dtls.parse_radio_file("./sample_data/2018-03-11/mqtt_sn_dtls/radio-messages.txt")
+@mqtt_sn_dtls = LogParser.new(3)
+@mqtt_sn_dtls.parse_powertrace_file("./sample_data/2018-03-11/mqtt_sn_dtls-3nodes/mote-output.txt")
+@mqtt_sn_dtls.parse_radio_file("./sample_data/2018-03-11/mqtt_sn_dtls-3nodes/radio-messages.txt")
